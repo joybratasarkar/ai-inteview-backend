@@ -1,0 +1,33 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python (dev)",
+            "type": "python",
+            "request": "launch",
+            "program": "usage.py",
+            "console": "integratedTerminal",
+            "env": {
+                "DEPLOY_ENV": "dev"
+            }
+        }, {
+            "name": "Python (prod)",
+            "type": "python",
+            "request": "launch",
+            "program": "usage.py",
+            "console": "integratedTerminal",
+            "env": {
+                "DEPLOY_ENV": "prod"
+            }
+        }, {
+            "name": "Python (stage)",
+            "type": "python",
+            "request": "launch",
+            "program": "usage.py",
+            "console": "integratedTerminal",
+            "env": {
+                "DEPLOY_ENV": "stage"
+            }
+        }
+    ]
+}
