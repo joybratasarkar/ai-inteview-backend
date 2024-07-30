@@ -12,6 +12,8 @@ from pydub.utils import make_chunks
 from pydub import AudioSegment
 import subprocess
 import os
+from functools import lru_cache
+from typing import List, Dict
 
 
 current_question_index = 0
@@ -31,7 +33,9 @@ job_management_service_v2_url = config[current_env]['job_management_service_v2']
 job_management_service_v1_url = config[current_env]['job_management_service_v1']
 summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
 
-classifier = pipeline("zero-shot-classification", model="facebook/bart-base")
+# classifier = pipeline("zero-shot-classification", model="facebook/bart-base")
+classifier = pipeline("zero-shot-classification")
+
 # wav2vec2_model = Wav2Vec2ForCTC.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-english")
 # tokenizer = Wav2Vec2Tokenizer.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-english")
 
@@ -375,3 +379,13 @@ def summarize_text(text: str) -> str:
     summary = summarizer(text, max_length=50, min_length=30, do_sample=False)
     return summary[0]['summary_text']
     # return text
+
+@lru_cache(maxsize=1000)
+def cached_summarize_text(text: str) -> str:
+    summary = summarize_text(text)
+    return summary
+
+
+async def process_batch(texts: List[str]) -> List[str]:
+    summaries = await asyncio.gather(*[asyncio.to_thread(cached_summarize_text, text) for text in texts])
+    return summaries

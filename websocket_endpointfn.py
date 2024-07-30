@@ -1,6 +1,6 @@
 from fastapi import WebSocket, WebSocketDisconnect
 from pydub import AudioSegment, silence
-from utils import process_audio_blob, is_general_question, format_project_details, create_prompt,detect_silence, extract_project_details,detect_silence_ffmpeg, questionAnswerArray, get_Interview_Question, get_project_info,summarize_text
+from utils import process_audio_blob, is_general_question, format_project_details, create_prompt,detect_silence,process_batch, extract_project_details,detect_silence_ffmpeg, questionAnswerArray, get_Interview_Question, get_project_info,summarize_text
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from prompt import chain_interview, general_prompt_template, llm, output_parser, chain_interview_end
@@ -143,51 +143,49 @@ class InterviewBot:
                 if self.current_question_index < len(self.temp_interview_questions):
                     question = self.temp_interview_questions[self.current_question_index]
                     self.candidate_responses[question] = text
-                    message = f" ok so,next question is  {question.replace('-', '')}"
-                    # print('question',question)
-                    await websocket.send_text(message)
-                    self.current_question_index += 1
-                else :
-                    message = f" Thank u for this interview Good luck "
-                    await websocket.send_text(message)
 
-                #     start_time = time.time()  # Start timing
+                    start_time = time.time()  # Start timing
 
-                #     summarized_text = await asyncio.to_thread(summarize_text, text)  # Run summarization in a separate thread
-                #     self.accumulated_audio = AudioSegment.empty()
-                #     self.accumulated_blobs = []
-                #     scores = is_general_question(summarized_text)
-                #     scores_dict = {label: scores.get(label, 0) for label in labels}
-                #     max_score_label = max(scores_dict, key=scores_dict.get)
+                    # Process batch of texts
+                    texts = [text]  # Modify this list as needed
+                    summarized_texts = await process_batch(texts)
+                    summarized_text = summarized_texts[0]  # Assuming single text input
 
-                #     response = None
-                #     if max_score_label == 'user_answer':
-                #         response = await asyncio.to_thread(chain_interview.invoke, {'response': summarized_text})  # Run response generation in a separate thread
-                #     elif max_score_label == 'repeat_request':
-                #         question_to_send = self.temp_interview_questions[self.current_question_index - 1] if self.current_question_index > 0 else question
-                #         await websocket.send_text(f"Ok, I will repeat the question: {question_to_send}")
-                #     elif max_score_label == 'interview_question':
-                #         response = await asyncio.to_thread(chain_interview.invoke, {'response': question})  # Run response generation in a separate thread
-                #     elif max_score_label == 'move_to_the_next_question':
-                #         response = await asyncio.to_thread(chain_interview.invoke, {'response': summarized_text})  # Run response generation in a separate thread
-                #         self.current_question_index += 1
-                #     elif max_score_label in ['follow_up', 'no_answer']:
-                #         response = await asyncio.to_thread(self.chain_general.invoke, {'context': summarized_text})  # Run response generation in a separate thread
+                    scores = is_general_question(summarized_text)  # Function to determine scores
+                    scores_dict = {label: scores.get(label, 0) for label in labels}
+                    max_score_label = max(scores_dict, key=scores_dict.get)
 
-                #     end_time = time.time()  # End timing
-                #     elapsed_time = end_time - start_time  # Calculate elapsed time
-                #     print(f"Time taken from summarize to generate response: {elapsed_time:.2f} seconds")
+                    response = None
+                    if max_score_label == 'user_answer':
+                        response = await asyncio.to_thread(chain_interview.invoke, {'response': summarized_text})
+                    elif max_score_label == 'repeat_request':
+                        question_to_send = self.temp_interview_questions[self.current_question_index - 1] if self.current_question_index > 0 else question
+                        await websocket.send_text(f"Ok, I will repeat the question: {question_to_send}")
+                    elif max_score_label == 'interview_question':
+                        response = await asyncio.to_thread(chain_interview.invoke, {'response': question})
+                    elif max_score_label == 'move_to_the_next_question':
+                        response = await asyncio.to_thread(chain_interview.invoke, {'response': summarized_text})
+                        self.current_question_index += 1
+                    elif max_score_label in ['follow_up', 'no_answer']:
+                        response = await asyncio.to_thread(self.chain_general.invoke, {'context': summarized_text})
 
-                #     if response:
-                #         message = f"{response}  {question.replace('-', '')}" if max_score_label != 'follow_up' else response
-                #         await websocket.send_text(message)
-                #         self.current_question_index += 1
+                    end_time = time.time()  # End timing
+                    elapsed_time = end_time - start_time  # Calculate elapsed time
+                    print(f"Time taken from summarize to generate response: {elapsed_time:.2f} seconds")
 
-                # else:
-                #     combined_responses = " ".join(self.candidate_responses.values())
-                #     summarized_responses = await asyncio.to_thread(summarize_text, combined_responses)  # Run summarization in a separate thread
-                #     response = await asyncio.to_thread(chain_interview_end.invoke, {'summary': summarized_responses})  # Run response generation in a separate thread
-                #     await websocket.send_json(response)
+                    if response:
+                        message = f"{response} {question.replace('-', '')}" if max_score_label != 'follow_up' else response
+                        await websocket.send_text(message)
+                        self.current_question_index += 1
+
+                else:
+                    combined_responses = " ".join(self.candidate_responses.values())
+                    texts = [combined_responses]  # Batch processing combined responses
+                    summarized_responses = await process_batch(texts)
+                    summarized_response = summarized_responses[0]  # Assuming single combined response
+
+                    response = await asyncio.to_thread(chain_interview_end.invoke, {'summary': summarized_response})
+                    await websocket.send_json(response)
 
         except WebSocketDisconnect:
             print("Client disconnected")

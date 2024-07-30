@@ -20,6 +20,13 @@ To run this application, ensure you have the following:
    chmod +x run
 
 
+### Notes:
+- **`requirements.txt`**: Make sure you have a `requirements.txt` file in your project directory that lists all the dependencies for your project.
+- **Batch File for Windows**: If you don't have a `run.bat` file, you can create one that includes the commands to run your application on Windows.
+
+Feel free to adjust the README to fit your specific project details!
+
+
 
 ### Notes:
 - **For Windows Users**: If you don’t have a `run.bat` file, you can create one to run your script. If the script requires specific commands, include them in the batch file.
