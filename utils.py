@@ -2,176 +2,55 @@ from pydub import AudioSegment, silence
 import numpy as np
 from transformers import pipeline
 import httpx
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Tokenizer
 import librosa
 import scipy.signal as signal
 import torch
 import asyncio
-import configparser
-import logging
-from pydub.utils import make_chunks
-from pydub import AudioSegment
-import subprocess
-import os
-from functools import lru_cache
-from typing import List, Dict
-
+0
 
 current_question_index = 0
 temp_interview_questions:[]
 # output_parser = StrOutputParser()
-# Load the configuration file
-config = configparser.ConfigParser()
-config.read('config.ini')
 
 
-# Set the current environment
-current_env = "dev"  # Change this to "staging" or "live" as needed
-logger = logging.getLogger(__name__)
-
-# Retrieve URLs for the current environment
-job_management_service_v2_url = config[current_env]['job_management_service_v2']
-job_management_service_v1_url = config[current_env]['job_management_service_v1']
-summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-
-# classifier = pipeline("zero-shot-classification", model="facebook/bart-base")
-classifier = pipeline("zero-shot-classification")
-
-# wav2vec2_model = Wav2Vec2ForCTC.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-english")
-# tokenizer = Wav2Vec2Tokenizer.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-english")
+classifier = pipeline("zero-shot-classification", model="facebook/bart-base")
+wav2vec2_model = Wav2Vec2ForCTC.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-english")
+tokenizer = Wav2Vec2Tokenizer.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-english")
 
 def process_audio_blob(audio_blob):
-    try:
-        # Convert raw audio bytes to numpy array (assuming it's PCM encoded)
-        audio_array = np.frombuffer(audio_blob, dtype=np.int16)
-        
-        # Create AudioSegment from numpy array (assuming it's mono, 16-bit PCM)
-        audio_segment = AudioSegment(
-            audio_array.tobytes(),
-            frame_rate=16000,  # Adjust based on your audio settings
-            sample_width=2,    # 16-bit audio
-            channels=1         # Mono audio
-        )
-        
-        return audio_segment
-    except Exception as e:
-        logger.error(f"Error processing audio blob: {e}")
-        return None
+    # Convert raw audio bytes to numpy array (assuming it's PCM encoded)
+    audio_array = np.frombuffer(audio_blob, dtype=np.int16)
 
-def detect_silence_ffmpeg(audio_segment, min_silence_len=5000, silence_thresh=-50):
-    try:
-        # Export audio segment to a temporary file
-        temp_audio_path = "temp_audio.wav"
-        audio_segment.export(temp_audio_path, format="wav")
-        
-        # Construct the FFmpeg command
-        command = [
-            "ffmpeg", "-v", "verbose", "-i", temp_audio_path, "-af",
-            f"silencedetect=n={silence_thresh}dB:d={min_silence_len / 1000}", "-f", "null", "-"
-        ]
-        
-        # Run the command and capture the output
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = process.communicate()
-        
-        # Decode the output
-        s = stderr.decode("utf-8")
-        lines = s.split('\n')
-        
-        # Extract silence start and end points
-        start, end = [], []
-        for line in lines:
-            if 'silence_start' in line:
-                start.append(float(line.split(':')[1].strip()))
-            elif 'silence_end' in line:
-                end.append(float(line.split('|')[0].split(':')[1].strip()))
-        
-        silent_ranges = list(zip(start, end))
-        logger.debug('silent_ranges: %s', silent_ranges)
-        
-        # Clean up temporary file
-        os.remove(temp_audio_path)
-        
-        # Check if any silence segment is longer than the specified threshold
-        for s, e in silent_ranges:
-            if (e - s) >= min_silence_len / 1000:
-                return True
-        
-        return False
-    except Exception as e:
-        logger.error(f"Error detecting silence: {e}")
-        return False
-
+    # Create AudioSegment from numpy array (assuming it's mono, 16-bit PCM)
+    audio_segment = AudioSegment(
+        audio_array.tobytes(),
+        frame_rate=16000,  # Adjust based on your audio settings
+        sample_width=2,    # 16-bit audio
+        channels=1         # Mono audio
+    )
     
-# def detect_silence(audio_segment, min_silence_len=3000, silence_thresh=-30):
-#     try:
-#         # Perform silence detection on the audio segment
-#         silent_ranges = silence.detect_silence(
-#             audio_segment, 
-#             min_silence_len=min_silence_len, 
-#             silence_thresh=silence_thresh,
-            
-#         )
-#         # print('silent_ranges',silent_ranges)
-#         # Check if any silence segment is longer than 4 seconds (4000 ms)
-#         for start, end in silent_ranges:
-#             if (end - start) >= min_silence_len:
-#                 return True
-        
-#         return False
-#     except Exception as e:
-#         logger.error(f"Error detecting silence: {e}")
-#         return False
+    return audio_segment
+
 def detect_silence(audio_segment, min_silence_len=3000, silence_thresh=-30):
-    try:
-        chunk_size = 10000  # 10 seconds chunks
-        silent_detected = False
-        
-        for start in range(0, len(audio_segment), chunk_size):
-            end = min(start + chunk_size, len(audio_segment))
-            chunk = audio_segment[start:end]
-            silent_ranges = silence.detect_silence(
-                chunk,
-                min_silence_len=min_silence_len,
-                silence_thresh=silence_thresh
-            )
-            
-            for start, end in silent_ranges:
-                if (end - start) >= min_silence_len:
-                    silent_detected = True
-                    break
-            
-            if silent_detected:
-                break
-            
-        return silent_detected
-    except Exception as e:
-        logger.error(f"Error detecting silence: {e}")
-        return False
-
+    # Perform silence detection on the audio segment
+    silent_ranges = silence.detect_silence(audio_segment, min_silence_len=min_silence_len, silence_thresh=silence_thresh)
+    # Check if any silence segment is longer than 4 seconds (4000 ms)
+    for start, end in silent_ranges:
+        if (end - start) >= 3000:
+            return True
     
+    return False    
 
-    
 def is_general_question(question):
     # candidate_labels = ['general', 'question', 'answer','no-answer','dont-know-the-answer','move-to-next-question']
-    # candidate_labels = ['general', 'question', 'answer','Unanswered','rephrase']
-    candidate_labels = [
-        'interview_question', 
-        'user_answer', 
-        'no_answer', 
-        'repeat_request', 
-        'move_to_the_next_question'
-    ]
-            # 'general_question', 
-
-            # 'follow_up',
-        # 'off_topic', 
-        # 'clarification_request', 
+    candidate_labels = ['general', 'question', 'answer','Unanswered']
 
     
     result = classifier(question, candidate_labels=candidate_labels, multi_label=True,device=0)
     print('Classifier result:', result) 
-    # Get the scores for the labels
-    scores = {label: score for label, score in zip(result['labels'], result['scores'])} 
+    
+    scores = {label: score for label, score in zip(result['labels'], result['scores'])} # Get the scores for the labels
 
     return  scores
     
@@ -258,75 +137,294 @@ def extract_project_details(response):
 
 
 
-# async def questionAnswerArray(project_info):
-#     # manual_questions = project_info.get('data', {}).get('ai_interviewer', {}).get('manual', {}).get('questions', [])
-#     # technical_questions = project_info.get('data', {}).get('ai_interviewer', {}).get('technical', {}).get('questions', [])
-#     global current_question_index
-#     global temp_interview_questions
-#     # manual_questions = project_info.get('data', {}).get('interview', {}).get('question_format', {}).get('manual', {}).get('questions', [])
-#     communication_questions = project_info.get('data', {}).get('interview', {}).get('question_format', {}).get('communication', {}).get('questions', [])
-    
-#     technical_questions = project_info.get('data', {}).get('interview', {}).get('question_format', {}).get('technical', {}).get('questions', [])
-#     temp_interview_questions = [q['question'] for q in  technical_questions +communication_questions]
-#     question = {
-#                 'index': current_question_index,
-#                 'question': temp_interview_questions[current_question_index],
-#                 'temp_interview_questions':temp_interview_questions
-#             }
-#     return temp_interview_questions
 
-async def questionAnswerArray(project_info):
-    global current_question_index
-    global temp_interview_questions
 
-    # Retrieve questions from the project_info dictionary
-    communication_questions = project_info.get('data', {}).get('ai_interviewer', {}).get('communication', {}).get('questions', [])
-    technical_questions = project_info.get('data', {}).get('ai_interviewer', {}).get('technical', {}).get('questions', [])
 
-    # Combine the questions from both categories
-    temp_interview_questions = [q['question'] for q in technical_questions + communication_questions]
 
-    # Prepare the question dictionary for the current index
-    question = {
-        'index': current_question_index,
-        'question': temp_interview_questions[current_question_index],
-        'temp_interview_questions': temp_interview_questions
+
+
+
+async def get_project_info():
+
+        return {
+    "_id": "****************",
+    "client_name": "infinix",
+    "client_id": "**********887",
+    "client_poc": [
+        {
+            "_id": "**********",
+            "email": "ioruw@sfa.zc",
+            "mobile_number": "+919878799889",
+            "client_poc": "sifusilfjsiol",
+            "comment": "uiouiio"
+        }
+    ],
+    "role": [
+        {
+            "_id": "****************",
+            "role": "Blockchain Developer"
+        }
+    ],
+    "experience_range": [
+        {
+            "_id": "**************",
+            "data": "3-7"
+        }
+    ],
+    "max_experience": 7,
+    "min_experience": 3,
+    "client_price": 333333,
+    "ss_price": 333333,
+    "month_of_engagement": [
+        {
+            "_id": "*********",
+            "data": "3 Months"
+        }
+    ],
+    "engagement_type": [
+        {
+            "_id": "*******",
+            "data": "Full-Time Contract"
+        }
+    ],
+    "no_requirements": 2,
+    "tentative_start": [
+        {
+            "_id": "********",
+            "data": "Not Specified"
+        }
+    ],
+    "secondary_skills": [
+        {
+            "_id": "******",
+            "skill": ".NET Compact Framework"
+        }
+    ],
+    "primary_skills": [
+        {
+            "_id": "*******",
+            "skill": "Typescript",
+            "competency": [
+                {
+                    "_id": "******",
+                    "data": "Expert"
+                }
+            ]
+        },
+        {
+            "_id": "******",
+            "skill": "Ruby on Rails",
+            "competency": [
+                {
+                    "_id": "******",
+                    "data": "Expert"
+                }
+            ]
+        }
+    ],
+    "working_time_zone": [
+        {
+            "_id": "*****",
+            "label": "Africa/Douala( UTC +00:13 )",
+            "data": "Africa/Douala"
+        }
+    ],
+    "working_hours": 40,
+    "travel_preference": [
+        {
+            "_id": "*****",
+            "data": "Remote"
+        }
+    ],
+    "locations": [],
+    "tools_used": [
+        {
+            "_id": "******",
+            "data": "Agile Practice"
+        }
+    ],
+    "system_provided": [
+        {
+            "_id": "******",
+            "data": "Not Specified"
+        }
+    ],
+    "no_of_rounds": 1,
+    "interview_rounds": [
+        {
+            "round_number": 1,
+            "round_name": "test"
+        }
+    ],
+    "communication_skill": [
+        {
+            "_id": "*****",
+            "data": "excellent"
+        }
+    ],
+    "job_responsibility": "<p>test</p>",
+    "interested_count": 0,
+    "interviewing_count": 0,
+    "hired_count": 0,
+    "rejected_count": 0,
+    "shortlisted_count": 0,
+    "is_world_wide": true,
+    "is_client_deleted": false,
+    "job_platform": "******",
+    "offer_sent_count": 0,
+    "offer_reject_count": 0,
+    "show_in_jd": false,
+    "platform_type": "pre-hire",
+    "type": "premium-job",
+    "project_status": "draft",
+    "rand_no": 64,
+    "sales_poc": [
+        {
+            "team_member_id": "******",
+            "first_name": "new presales",
+            "last_name": "test",
+            "profile_pic": null,
+            "_id": "66139dc124dafe1e6601b3b7"
+        }
+    ],
+    "status": "assigned",
+    "mark_as_active": true,
+    "mark_as_active_date": "2024-04-08T07:33:21.807Z",
+    "is_screening_question_added": false,
+    "linkedin_job_title": "SDE",
+    "project_logs": [
+        {
+            "status": "added",
+            "user_name": "admin admin",
+            "user_id": "63c7f3183a3ac2508b654968",
+            "user_role": "admin",
+            "created_at": "2024-04-08T07:33:21.843Z",
+            "_id": "66139dc124dafe1e6601b3b8"
+        }
+    ],
+    "post_to_career_page": true,
+    "department": [],
+    "experience_level": [],
+    "preffered_location": [],
+    "education_type": [],
+    "hiring_manager": [],
+    "contact_person": [],
+    "tags": [],
+    "interview_rounds_ats": [],
+    "cooling_period_department": [],
+    "cooling_period_location": [],
+    "internship_duration": [],
+    "project_duration": [],
+    "reason_for_job_close": [],
+    "reason_for_job_paused": [],
+    "talent_manager_associate": [
+        {
+            "talent_associate_id": "*****",
+            "first_name": "vikrant",
+            "last_name": "aswan",
+            "email": "vikrant*****@yopmail.com",
+            "createdAt": "2024-08-01T06:34:49.306Z",
+            "_id": "66ab2c89cfb7f11877b4e145"
+        }
+    ],
+    "vendor_details": [],
+    "vendor_admin": [],
+    "screening_question_added_by": [],
+    "screening_question_updated_by": [],
+    "ai_interviewer": [],
+    "createdAt": "2024-04-08T07:33:21.854Z",
+    "updatedAt": "2024-08-01T07:05:14.106Z",
+    "project_id": "INF0001519",
+    "__v": 0,
+    "cron_date": "2024-04-18T00:00:00.000Z",
+    "hiring_type": [
+        {
+            "_id": "6634b12b46acb34dc835f353",
+            "data": "Contractual"
+        }
+    ],
+    "dummy_no_requirements": 25,
+    "ai_interviewer2": {
+        "no_of_questions": 2,
+        "technical": {
+            "questions": [
+                {
+                    "question": "- Can you explain the difference between a module and a namespace in TypeScript?",
+                    "_id": "66ab33aacfb7f11877b4e99c"
+                },
+                {
+                    "question": "- How would you implement an authentication system in a Ruby on Rails application?",
+                    "_id": "66ab33aacfb7f11877b4e99d"
+                }
+            ],
+            "_id": "66ab33aacfb7f11877b4e99b"
+        },
+        "manual": {
+            "questions": [],
+            "keywords": []
+        },
+        "status": "active",
+        "added_by_id": "*****",
+        "added_by_name": "admin ***",
+        "added_by_role": "admin",
+        "_id": "***********",
+        "createdAt": "2024-08-01T07:05:14.116Z"
+    },
+    "ai_interviewer_template_id": "*********",
+    "screeningquestions": [],
+    "no_requirements_fullfilled": 0,
+    "job_counts": {
+        "overall_counts": {
+            "project_id": "66139dc124dafe1e6601b3b6",
+            "shortlisted": "0",
+            "clientsubmitted": "0",
+            "selected": "0",
+            "onboarded": "0",
+            "interviewing": "0",
+            "rejected": 0,
+            "autoRejected": "1"
+        },
+        "applied": {
+            "appliedDeveloper": 1,
+            "vendorAppliedDeveloper": 0,
+            "outboundDeveloper": 0,
+            "recruiterFreelancerDeveloper": 0
+        },
+        "total_applied": 2,
+        "shortListed": 0,
+        "screening": 0,
+        "vetting": {
+            "skillVetting": 0,
+            "verification": 0,
+            "hrVetting": 0
+        },
+        "interviews": [
+            {
+                "round": 0
+            },
+            {
+                "round": 0
+            },
+            {
+                "round": 0
+            },
+            {
+                "round": 0
+            }
+        ],
+        "hired": {
+            "selected": 0,
+            "offerSent": 0
+        },
+        "clientOnboarding": 0,
+        "rejected": {
+            "movedToBenchpool": 0,
+            "reject": 1
+        },
+        "clientSubmitted": 0
     }
+}
 
-    # Print for debugging (optional)
-
-
-    return temp_interview_questions
-
-
-
-
-
-
-
-async def get_Interview_Question(projectId):
-    # Encode the job_id in base64
-    async with httpx.AsyncClient() as client:
-
-        url = f"{job_management_service_v2_url}{projectId}"
-
-        # print('url',url)
-        response = await client.get(url)
-        response.raise_for_status()
-        return response.json()
-
-
-async def get_project_info(projectId):
-    # Encode the job_id in base64
-    async with httpx.AsyncClient() as client:
-    
-    
-        url = f"{job_management_service_v1_url}{projectId}"
-
-       
-        response = await client.get(url)
-        response.raise_for_status()
-        return response.json()
 
 
 
@@ -370,22 +468,3 @@ async def get_project_info(projectId):
 #         complete_sentence = self.ongoing_transcription + transcription
 #         self.ongoing_transcription = ""
 #         return complete_sentence
-
-def summarize_text(text: str) -> str:
-    # Ensure the text does not exceed model's max length
-    # max_length = 50  # Set appropriate max length based on model
-    # if len(text) > max_length:
-        # Summarize the text
-    summary = summarizer(text, max_length=50, min_length=30, do_sample=False)
-    return summary[0]['summary_text']
-    # return text
-
-@lru_cache(maxsize=1000)
-def cached_summarize_text(text: str) -> str:
-    summary = summarize_text(text)
-    return summary
-
-
-async def process_batch(texts: List[str]) -> List[str]:
-    summaries = await asyncio.gather(*[asyncio.to_thread(cached_summarize_text, text) for text in texts])
-    return summaries
