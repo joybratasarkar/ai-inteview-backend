@@ -33,14 +33,32 @@ def process_audio_blob(audio_blob):
     return audio_segment
 
 def detect_silence(audio_segment, min_silence_len=3000, silence_thresh=-30):
-    # Perform silence detection on the audio segment
-    silent_ranges = silence.detect_silence(audio_segment, min_silence_len=min_silence_len, silence_thresh=silence_thresh)
-    # Check if any silence segment is longer than 4 seconds (4000 ms)
-    for start, end in silent_ranges:
-        if (end - start) >= 3000:
-            return True
-    
-    return False    
+    try:
+        chunk_size = 10000  # 10 seconds chunks
+        silent_detected = False
+        
+        for start in range(0, len(audio_segment), chunk_size):
+            end = min(start + chunk_size, len(audio_segment))
+            chunk = audio_segment[start:end]
+            silent_ranges = silence.detect_silence(
+                chunk,
+                min_silence_len=min_silence_len,
+                silence_thresh=silence_thresh
+            )
+            
+            for start, end in silent_ranges:
+                if (end - start) >= min_silence_len:
+                    silent_detected = True
+                    break
+            
+            if silent_detected:
+                break
+            
+        return silent_detected
+    except Exception as e:
+        logger.error(f"Error detecting silence: {e}")
+        return False
+ 
 
 def is_general_question(question):
     # candidate_labels = ['general', 'question', 'answer','no-answer','dont-know-the-answer','move-to-next-question']
