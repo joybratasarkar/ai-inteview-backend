@@ -28,8 +28,3 @@ Feel free to adjust the README to fit your specific project details!
 
 
 
-### Notes:
-- **For Windows Users**: If you don’t have a `run.bat` file, you can create one to run your script. If the script requires specific commands, include them in the batch file.
-- **Environment Variables**: Ensure your `.env` file is included in your `.gitignore` to prevent sensitive information from being committed to the repository.
-
-Feel free to adjust the README to fit your specific project details!
