@@ -1,23 +1,17 @@
 from fastapi import WebSocket, WebSocketDisconnect
 from pydub import AudioSegment, silence
 import numpy as np
-from utils import process_audio_blob, detect_silence, is_general_question, create_prompt, detect_silence, extract_project_details, get_project_info
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from prompt import chain_interview, general_prompt_template, llm, output_parser, chain_interview_end
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
 import json
-import warnings
-
 from base64 import b64encode
-import torchaudio
-import io
+import logging
 
-from io import BytesIO
-import whisper
-
-# Suppress specific warnings
-warnings.filterwarnings("ignore", message="FP16 is not supported on CPU; using FP32 instead")
-
+logger = logging.getLogger(__name__)
+executor = ThreadPoolExecutor(max_workers=10)
+from utils import (
+    parse_resume, summarize_resume, generate_initial_question, generate_follow_up_question, AgentState, InterviewGraph,process_audio_blob,detect_silence
+)
 class InterviewBot:
     def __init__(self):
         self.interview_questions = []
@@ -25,128 +19,122 @@ class InterviewBot:
         self.candidate_responses = {}
         self.ongoing_transcription = ""
         self.chain_general = None
-        self.temp_interview_questions = [ "Can you explain the difference between a module and a namespace in TypeScript?",
-    "How would you implement an authentication system in a Ruby on Rails application?"]
+        self.temp_interview_questions = []
+        self.accumulated_audio = AudioSegment.empty()
+        self.accumulated_blobs = []
 
+    # Ensure this method is not nested within __init__
     async def silence_detection(self, websocket: WebSocket):
+        self.silence_detection_socket = websocket
+        self.accumulated_blobs = []
+        self.accumulated_audio = AudioSegment.empty()
+
         await websocket.accept()
-        accumulated_audio = AudioSegment.silent(duration=0, frame_rate=16000)
-        accumulated_blobs = []
-    
+
+        # Start a background task for sending periodic pings/heartbeats
+        heartbeat_task = asyncio.create_task(self.send_heartbeat(websocket))
+
         try:
             while True:
                 try:
-                    audio_blob = await websocket.receive_bytes()
-                    with open("received_audio.wav", "wb") as f:
-                        f.write(audio_blob)
-                    audio_segment = process_audio_blob(audio_blob)
+                    audio_blob = await asyncio.wait_for(websocket.receive_bytes(), timeout=10.0)
+                    loop = asyncio.get_running_loop()
+                    audio_segment = await loop.run_in_executor(executor, process_audio_blob, audio_blob)
+
                     if audio_segment is None:
                         continue
-                    accumulated_blobs.append(audio_blob)
-                    accumulated_audio += audio_segment
-                    silent_detected = detect_silence(accumulated_audio)
-                    if silent_detected:
-                        accumulated_audio = AudioSegment.empty()
-                        serialized_blobs = [b64encode(blob).decode('utf-8') for blob in accumulated_blobs]
-                        response_data = {'silence_detected': silent_detected, 'completeBlob': serialized_blobs}
-                        await websocket.send_text(json.dumps(response_data))
-                        accumulated_blobs = []
-                except WebSocketDisconnect:
-                    print('Silence Detection Socket disconnected')
-                    break
-                except Exception as e:
-                    print(f"Error: {e}")
-    
-        except WebSocketDisconnect:
-            print('Silence Detection Socket disconnected')
-        except Exception as e:
-            print(f"Error: {e}")
-            
-        
 
+                    self.accumulated_blobs.append(audio_blob)
+                    self.accumulated_audio += audio_segment
+
+                    silent_detected, cleaned_audio, overall_dBFS = await loop.run_in_executor(executor, detect_silence, self.accumulated_audio)
+
+                    if silent_detected:
+                        self.accumulated_audio = AudioSegment.empty()
+                        self.accumulated_blobs = []
+                        serialized_blobs = [b64encode(blob).decode('utf-8') for blob in self.accumulated_blobs]
+                        response_data = {'silence_detected': silent_detected, 'completeBlob': serialized_blobs, 'overall_dBFS_int': overall_dBFS}
+
+                        if not websocket.client_state == WebSocketState.CONNECTED:
+                            logger.error("WebSocket is not connected")
+                            break
+
+                        await websocket.send_text(json.dumps(response_data))
+
+                    else:
+                        if not websocket.client_state == WebSocketState.CONNECTED:
+                            logger.error("WebSocket is not connected")
+                            break
+
+                        await websocket.send_text(json.dumps({'silence_detected': False, 'completeBlob': [], 'overall_dBFS_int': overall_dBFS}))
+
+                except asyncio.TimeoutError:
+                    logger.info('No data received within timeout period, sending keep-alive message')
+                    if not websocket.client_state == WebSocketState.CONNECTED:
+                        logger.error("WebSocket is not connected")
+                        break
+
+                    await websocket.send_text(json.dumps({'silence_detected': False, 'completeBlob': []}))
+
+                except WebSocketDisconnect:
+                    logger.info('Silence Detection WebSocket disconnected')
+                    break
+
+                except Exception as e:
+                    logger.error(f"Error in silence_detection inner loop: {e}")
+                    if websocket.client_state == WebSocketState.CONNECTED:
+                        await websocket.send_text(json.dumps({'error': str(e)}))
+
+        except WebSocketDisconnect:
+            logger.info('Silence Detection WebSocket disconnected')
+
+        except Exception as e:
+            logger.error(f"Error in silence_detection outer loop: {e}")
+
+        finally:
+            heartbeat_task.cancel()  # Ensure heartbeat task is stopped when the WebSocket closes
 
     async def websocket_endpoint(self, websocket: WebSocket):
         await websocket.accept()
         try:
+            state = AgentState()
+
             while True:
-                data = await websocket.receive_json()
-                if data:
-                    job_id = data.get('job_id')
-                    projectId = data.get('projectId')
-                    project_details = await get_project_info()
-                    details = extract_project_details(project_details)
-                    prompt_update = create_prompt(details, general_prompt_template)
-                    general_prompt = ChatPromptTemplate.from_template(prompt_update)
-                    self.chain_general = general_prompt | llm | output_parser
+                data = await websocket.receive_text()
+                logging.info(f"Received data: {data}")
 
-                    if self.interview_questions:
-                        first_question = self.interview_questions[self.current_question_index]
-                        await websocket.send_text(f"{first_question}")
-        except WebSocketDisconnect:
-            print("Client disconnected")
-        except Exception as e:
-            await websocket.send_text(f"Error: {e}")
+                if data.startswith("UPLOAD_RESUME"):
+                    pdf_data = await websocket.receive_bytes()
+                    resume_text = parse_resume(pdf_data)
+                    state.summary = summarize_resume(resume_text, method="map_reduce")
+                    logging.info(f"Resume summary: {state.summary}")
 
-    async def question_answering(self, websocket: WebSocket):
-        await websocket.accept()
-        self.current_question_index = 1
+                    graph = InterviewGraph(state)
 
-        try:
-            while True:
-                data = await websocket.receive_json()
-                if data:
-                    job_id = data.get('projectId')
-                    sender = data.get('sender')
-                    text = data.get('text')
+                    start_message = graph.start_interview()
+                    first_question = graph.ask_question()
+                    state.last_question = first_question
+                    await websocket.send_text(json.dumps({"question": first_question}))
 
-                    if self.current_question_index < len(self.temp_interview_questions):
-                        question = self.temp_interview_questions[self.current_question_index]
-                        self.candidate_responses[question] = text
-                        scores = is_general_question(text)
-                        general_score = scores.get('general', 0)
-                        question_score = scores.get('question', 0)
-                        answer_score = scores.get('answer', 0)
-                        Unanswered = scores.get('Unanswered', 0)
+                elif data.startswith("ANSWER"):
+                    answer = data.split(":")[1].strip()
+                    logging.info(f"Received answer: {answer}")
+                    state.last_answer = answer
 
-                        response = None
-                        if answer_score > max(general_score, question_score, Unanswered):
-                            response = chain_interview.invoke({'response': text})
-                        elif question_score > max(general_score, answer_score, Unanswered):
-                            response = chain_interview.invoke({'response': text})
-                        elif Unanswered > max(general_score, question_score, answer_score):
-                            response = chain_interview.invoke({'response': text})
-                        elif general_score > max(Unanswered, question_score, answer_score):
-                            response = self.chain_general.invoke({'context': text})
+                    follow_up_question = graph.follow_up_question()
+                    state.last_question = follow_up_question
+                    await websocket.send_text(json.dumps({"question": follow_up_question}))
 
-                        if response:
-                            cleaned_string = question.replace("-", "")
-                            merged_message = f"{response}{cleaned_string}"
-                            self.current_question_index += 1
-                            if general_score > max(question_score, answer_score, Unanswered):
-                                await websocket.send_text(f"{response}")
-                            else:
-                                await websocket.send_text(f"Next Question {merged_message}")
-                        else:
-                            combined_responses = " ".join(self.candidate_responses.values())
-                            response = chain_interview_end.invoke({'summary': combined_responses})
-                            await websocket.send_json(response)
-                    elif general_score > max(Unanswered, question_score, answer_score):
-                        response = chain_interview.invoke({'response': text})
-                        await websocket.send_text(f"{response}")
-                    else:
-                        combined_responses = " ".join(self.candidate_responses.values())
-                        response = chain_interview_end.invoke({'summary': combined_responses})
-                        await websocket.send_json(response)
-                        break
+                elif data == "END":
+                    end_message = graph.end_interview()
+                    await websocket.send_text(json.dumps({"message": end_message}))
+                    break
 
         except WebSocketDisconnect:
-            print("Client disconnected")
-        except Exception as e:
-            await websocket.send_text(f"Error: {e}")
+            logging.info("Client disconnected.")
 
 # Create an instance of the InterviewBot class
 interview_bot = InterviewBot()
 
 silence_detection = interview_bot.silence_detection
 websocket_endpoint = interview_bot.websocket_endpoint
-question_answering = interview_bot.question_answering

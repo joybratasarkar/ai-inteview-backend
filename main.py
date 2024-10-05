@@ -42,17 +42,6 @@ async def websocket_handler(websocket: WebSocket):
     except Exception as e:
         logger.error(f"Error in websocket_handler: {e}")
 
-# WebSocket route for question answering
-@app.websocket("/questionAnswering")
-async def question_answering_handler(websocket: WebSocket):
-    try:
-        await interview_bot.question_answering(websocket)
-    except WebSocketDisconnect:
-        logger.info("Question Answering WebSocket disconnected")
-    except Exception as e:
-        logger.error(f"Error in question_answering_handler: {e}")
-
-
 @app.post("/close_sockets_main_socket")
 async def close_connections():
     await interview_bot.close_sockets_main_socket()
