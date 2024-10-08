@@ -105,8 +105,9 @@ class InterviewBot:
                 if data.startswith("UPLOAD_RESUME"):
                     pdf_data = await websocket.receive_bytes()
                     resume_text = parse_resume(pdf_data)
-                    state.summary = summarize_resume(resume_text, method="map_reduce")
+                    state.summary = await summarize_resume(resume_text)
                     logging.info(f"Resume summary: {state.summary}")
+                    await websocket.send_text(json.dumps({"loader": False}))
 
                     graph = InterviewGraph(state)
 

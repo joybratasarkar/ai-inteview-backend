@@ -17,6 +17,11 @@ import os
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph
 import logging
+import time
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.summarizers.lex_rank import LexRankSummarizer
+
 
 load_dotenv()
 
@@ -34,8 +39,13 @@ wav2vec2_model = Wav2Vec2ForCTC.from_pretrained("jonatasgrosman/wav2vec2-large-x
 tokenizer = Wav2Vec2Tokenizer.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-english")
 
 # Precompute embeddings for "move on" intent responses
-move_on_responses = ["next question please", "I don’t know", "pass", "skip", "move on",]
+move_on_responses = [
+    "next question please", "I don’t know", "pass", "skip", "move on", 
+    "end the interview", "let's stop here", "no more questions", "I’m done", 
+    "that’s all", "let's wrap up", "I’m finished"
+]
 move_on_embeddings = model.encode(move_on_responses, convert_to_tensor=True)
+summarization_pipeline = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
 
 
 def process_audio_blob(audio_blob, chunk_size=1024):
@@ -193,16 +203,16 @@ def is_general_question(question):
 
 
 
-
-
+# AgentState Class to track state information during the interview
 class AgentState:
     def __init__(self, summary=None, last_answer=None):
         self.summary = summary
-        self.last_answer = None
+        self.last_answer = last_answer
         self.asked_questions = []  # Keep a history of asked questions
         self.last_question = None  # Track the last question asked
+        self.question_count = 0    # Track the number of questions asked
 
-# Function to parse PDF resume using pdfplumber and return text
+# Parse the PDF resume
 def parse_resume(pdf_file_data: bytes):
     try:
         logging.info("Attempting to parse PDF resume")
@@ -221,14 +231,24 @@ def parse_resume(pdf_file_data: bytes):
         logging.error(f"Error parsing file: {str(e)}")
         raise ValueError(f"Failed to parse file: {str(e)}")
 
-# Summarize the resume using LangChain's summarization chain
-def summarize_resume(text: str, method="map_reduce"):
-    documents = [Document(page_content=text)]
-    summarize_chain = load_summarize_chain(llm, chain_type=method)
-    summary = summarize_chain.invoke(documents)
-    return summary
+# Summarize the resume
+async def summarize_resume(text: str, min_sentences=6, max_sentences=15):
+    if not text:
+        raise ValueError("Empty text received for summarization.")
 
-# Generate the initial interview question based on the resume summary
+    start_time = time.time()
+    parser = PlaintextParser.from_string(text, Tokenizer("english"))
+    summarizer = LexRankSummarizer()
+    summary_sentences = summarizer(parser.document, sentences_count=max_sentences)
+    selected_summary = summary_sentences[:max(min_sentences, len(summary_sentences))]
+    summary = " ".join(str(sentence) for sentence in selected_summary)
+    
+    end_time = time.time()
+    logging.info(f"Summarization took {end_time - start_time:.2f} seconds.")
+    
+    return summary 
+
+# Generate initial question
 def generate_initial_question(summary: str) -> str:
     logging.info(f"Generating initial question based on summary: {summary}")
     prompt = f"""
@@ -239,36 +259,79 @@ def generate_initial_question(summary: str) -> str:
     response = llm.invoke(prompt)
     return response.content.strip()
 
-# Detect if the candidate's response implies they want to move on
-# def is_move_on_intent(answer: str) -> bool:
-#     answer_embedding = model.encode(answer, convert_to_tensor=True)
-#     similarities = util.pytorch_cos_sim(answer_embedding, move_on_embeddings)
-#     return max(similarities[0]).item() > 0.7
-def is_move_on_intent(answer: str) -> bool:
+# Determine if user intent indicates moving on
+# Updated `is_move_on_intent` with refined matching and more diversified phrases
+def is_move_on_intent(answer: str, threshold=0.3) -> (bool, str):
     answer_embedding = model.encode(answer, convert_to_tensor=True)
-    similarities = util.pytorch_cos_sim(answer_embedding, move_on_embeddings)
     
-    # Log the similarity scores for debugging
-    similarity_scores = similarities[0].cpu().numpy()
-    logging.info(f"Similarity scores: {similarity_scores}")
+    # Calculate cosine similarities between the answer and each move-on response
+    similarities = util.pytorch_cos_sim(answer_embedding, move_on_embeddings).squeeze(0)
+    max_similarity, best_match_index = similarities.max().item(), similarities.argmax().item()
     
-    # Determine if any of the similarities exceed the threshold
-    max_similarity = max(similarity_scores)
-    logging.info(f"Max similarity score: {max_similarity}")
-    
-    return max_similarity > 0.7  # Adjust the threshold as needed
+    # Retrieve the best matching phrase
+    best_match_phrase = move_on_responses[best_match_index]
+    logging.info(f"Best match phrase: '{best_match_phrase}' with similarity score: {max_similarity}")
 
-# Generate follow-up questions based on the candidate's answer and the resume summary
+    # Determine if this similarity exceeds the threshold
+    return max_similarity > threshold, best_match_phrase if max_similarity > threshold else None
+
+
+
+# Generate follow-up question based on intent and simulate realistic interview behavior
 def generate_follow_up_question(answer: str, summary: str, question: str, asked_questions: list) -> str:
-    if is_move_on_intent(answer):
-        prompt = f"Based on the following resume summary: {summary}. Generate the next interview question."
+    # Check if the candidate's response matches a move-on intent and get the matched phrase
+    intent_score, best_match_phrase = is_move_on_intent(answer)
+    logging.info(f"Best match phrase: '{best_match_phrase}' with similarity score: {intent_score}")
+
+    # Route the prompt based on the best match phrase
+    if best_match_phrase in ["I don’t know", "pass", "skip"]:
+        # If the candidate doesn't know or wants to skip, move to a different topic
+        prompt = (
+            f"The candidate's response of '{answer}' indicates uncertainty or a desire to skip. "
+            f"As an interviewer, ask a question that explores another aspect of their role related to '{summary}', "
+            f"and avoid the previous topic '{question}'. Focus on a new area of expertise."
+        )
+    elif best_match_phrase in ["next question please", "move on"]:
+        # Candidate wants to move on, proceed to the next relevant topic
+        prompt = (
+            f"The candidate's response of '{answer}' suggests they want to proceed to another topic. "
+            f"Ask them to describe their experience with a different technology or project related to their role, "
+            f"focusing on skills listed in their resume summary: '{summary}'."
+        )
+    elif best_match_phrase in ["end the interview", "let's stop here", "no more questions", "I’m done", "that’s all", "let's wrap up", "I’m finished"]:
+        # Candidate wants to end the interview
+        logging.info("Ending interview based on candidate's response.")
+        return "Thank you for your time. We’ll conclude the interview here. Best of luck with your next steps!"
+    else:
+        # Standard case for follow-up if no specific move-on intent is detected
+        prompt = (
+            f"Candidate's answer: '{answer}'. Resume summary: '{summary}'. Previous question: '{question}'. "
+            f"Generate a follow-up question that dives into technical specifics, focusing on their usage of "
+            f"relevant tools, techniques, or technologies, and ask them to elaborate on the process."
+        )
+
+    try:
         response = llm.invoke(prompt)
         next_question = response.content.strip()
+        
+        # Log the generated follow-up question
+        logging.info(f"Generated follow-up question: {next_question}")
+
+        # Check for previously asked questions to avoid repetition
+        if next_question in asked_questions:
+            prompt += " Ensure this follow-up question is unique and hasn't been covered already."
+            response = llm.invoke(prompt)
+            next_question = response.content.strip()
+            logging.info(f"Modified follow-up question to avoid repetition: {next_question}")
+
         return next_question
 
-    prompt = f"Candidate's answer: {answer}. Resume summary: {summary}. Generate a follow-up interview question."
-    response = llm.invoke(prompt)
-    return response.content.strip()
+    except Exception as e:
+        logging.error(f"Error in generate_follow_up_question: {e}")
+        return "Could you clarify your answer or provide more details about your interest?"
+
+
+
 
 # StateGraph for managing interview process
 class InterviewGraph(StateGraph):
@@ -292,14 +355,28 @@ class InterviewGraph(StateGraph):
         return "Let's start the interview!"
 
     def ask_question(self):
+        if self.state.question_count >= 8:  # Limit questions to a maximum of 8
+            return self.end_interview()
         first_question = generate_initial_question(self.state.summary)
+        self.state.asked_questions.append(first_question)
+        self.state.last_question = first_question
+        self.state.question_count += 1
         return first_question
 
     def follow_up_question(self):
         answer = self.state.last_answer
         summary = self.state.summary
         question = self.state.last_question
-        return generate_follow_up_question(answer, summary, question, self.state.asked_questions)
+
+        if self.state.question_count >= 8:  # Limit to a maximum of 8 questions
+            return self.end_interview()
+
+        next_question = generate_follow_up_question(answer, summary, question, self.state.asked_questions)
+        if next_question not in self.state.asked_questions:
+            self.state.asked_questions.append(next_question)
+            self.state.last_question = next_question
+            self.state.question_count += 1
+        return next_question
 
     def end_interview(self):
         logging.info("Interview ended.")
