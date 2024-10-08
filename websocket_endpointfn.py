@@ -28,71 +28,70 @@ class InterviewBot:
         self.silence_detection_socket = websocket
         self.accumulated_blobs = []
         self.accumulated_audio = AudioSegment.empty()
-
+    
         await websocket.accept()
-
+    
         # Start a background task for sending periodic pings/heartbeats
         heartbeat_task = asyncio.create_task(self.send_heartbeat(websocket))
-
+    
         try:
             while True:
                 try:
                     audio_blob = await asyncio.wait_for(websocket.receive_bytes(), timeout=10.0)
                     loop = asyncio.get_running_loop()
                     audio_segment = await loop.run_in_executor(executor, process_audio_blob, audio_blob)
-
+    
                     if audio_segment is None:
                         continue
-
+    
                     self.accumulated_blobs.append(audio_blob)
                     self.accumulated_audio += audio_segment
-
+    
                     silent_detected, cleaned_audio, overall_dBFS = await loop.run_in_executor(executor, detect_silence, self.accumulated_audio)
-
+    
                     if silent_detected:
                         self.accumulated_audio = AudioSegment.empty()
                         self.accumulated_blobs = []
                         serialized_blobs = [b64encode(blob).decode('utf-8') for blob in self.accumulated_blobs]
                         response_data = {'silence_detected': silent_detected, 'completeBlob': serialized_blobs, 'overall_dBFS_int': overall_dBFS}
-
-                        if not websocket.client_state == WebSocketState.CONNECTED:
-                            logger.error("WebSocket is not connected")
-                            break
-
+    
                         await websocket.send_text(json.dumps(response_data))
-
+    
                     else:
-                        if not websocket.client_state == WebSocketState.CONNECTED:
-                            logger.error("WebSocket is not connected")
-                            break
-
                         await websocket.send_text(json.dumps({'silence_detected': False, 'completeBlob': [], 'overall_dBFS_int': overall_dBFS}))
-
+    
                 except asyncio.TimeoutError:
                     logger.info('No data received within timeout period, sending keep-alive message')
-                    if not websocket.client_state == WebSocketState.CONNECTED:
-                        logger.error("WebSocket is not connected")
-                        break
-
                     await websocket.send_text(json.dumps({'silence_detected': False, 'completeBlob': []}))
-
+    
                 except WebSocketDisconnect:
                     logger.info('Silence Detection WebSocket disconnected')
                     break
-
+    
                 except Exception as e:
                     logger.error(f"Error in silence_detection inner loop: {e}")
-                    if websocket.client_state == WebSocketState.CONNECTED:
-                        await websocket.send_text(json.dumps({'error': str(e)}))
-
+                    await websocket.send_text(json.dumps({'error': str(e)}))
+    
         except WebSocketDisconnect:
             logger.info('Silence Detection WebSocket disconnected')
-
+    
         except Exception as e:
             logger.error(f"Error in silence_detection outer loop: {e}")
-
+    
         finally:
             heartbeat_task.cancel()  # Ensure heartbeat task is stopped when the WebSocket closes
+
+    async def send_heartbeat(self, websocket: WebSocket, interval: float = 30.0):
+        """Send a heartbeat message every `interval` seconds to keep the connection alive."""
+        try:
+            while True:
+                # Simply send a heartbeat without checking specific state
+                await websocket.send_text(json.dumps({"type": "heartbeat", "message": "keep-alive"}))
+                await asyncio.sleep(interval)
+        except WebSocketDisconnect:
+            logging.info("Heartbeat task stopped due to WebSocket disconnect.")
+        except Exception as e:
+            logging.error(f"Error in send_heartbeat: {e}")
 
     async def websocket_endpoint(self, websocket: WebSocket):
         await websocket.accept()
