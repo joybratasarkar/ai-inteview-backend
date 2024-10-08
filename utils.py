@@ -34,7 +34,7 @@ wav2vec2_model = Wav2Vec2ForCTC.from_pretrained("jonatasgrosman/wav2vec2-large-x
 tokenizer = Wav2Vec2Tokenizer.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-english")
 
 # Precompute embeddings for "move on" intent responses
-move_on_responses = ["next question please", "I don’t know", "pass", "skip", "move on"]
+move_on_responses = ["next question please", "I don’t know", "pass", "skip", "move on",]
 move_on_embeddings = model.encode(move_on_responses, convert_to_tensor=True)
 
 
@@ -240,10 +240,23 @@ def generate_initial_question(summary: str) -> str:
     return response.content.strip()
 
 # Detect if the candidate's response implies they want to move on
+# def is_move_on_intent(answer: str) -> bool:
+#     answer_embedding = model.encode(answer, convert_to_tensor=True)
+#     similarities = util.pytorch_cos_sim(answer_embedding, move_on_embeddings)
+#     return max(similarities[0]).item() > 0.7
 def is_move_on_intent(answer: str) -> bool:
     answer_embedding = model.encode(answer, convert_to_tensor=True)
     similarities = util.pytorch_cos_sim(answer_embedding, move_on_embeddings)
-    return max(similarities[0]).item() > 0.7
+    
+    # Log the similarity scores for debugging
+    similarity_scores = similarities[0].cpu().numpy()
+    logging.info(f"Similarity scores: {similarity_scores}")
+    
+    # Determine if any of the similarities exceed the threshold
+    max_similarity = max(similarity_scores)
+    logging.info(f"Max similarity score: {max_similarity}")
+    
+    return max_similarity > 0.7  # Adjust the threshold as needed
 
 # Generate follow-up questions based on the candidate's answer and the resume summary
 def generate_follow_up_question(answer: str, summary: str, question: str, asked_questions: list) -> str:
