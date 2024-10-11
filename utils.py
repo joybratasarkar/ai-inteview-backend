@@ -355,7 +355,7 @@ class InterviewGraph(StateGraph):
         return "Let's start the interview!"
 
     def ask_question(self):
-        if self.state.question_count >= 8:  # Limit questions to a maximum of 8
+        if self.state.question_count >= 4:  # Limit questions to a maximum of 8
             return self.end_interview()
         first_question = generate_initial_question(self.state.summary)
         self.state.asked_questions.append(first_question)
@@ -368,7 +368,7 @@ class InterviewGraph(StateGraph):
         summary = self.state.summary
         question = self.state.last_question
 
-        if self.state.question_count >= 8:  # Limit to a maximum of 8 questions
+        if self.state.question_count >= 4:  # Limit to a maximum of 8 questions
             return self.end_interview()
 
         next_question = generate_follow_up_question(answer, summary, question, self.state.asked_questions)
