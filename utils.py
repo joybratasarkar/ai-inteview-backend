@@ -1,100 +1,174 @@
 from pydub import AudioSegment, silence
 import numpy as np
 from transformers import pipeline
-import httpx
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Tokenizer
-import librosa
-import scipy.signal as signal
 import torch
-import asyncio
 import pdfplumber
 from io import BytesIO
-from langchain.chains.summarize import load_summarize_chain
-from langchain.docstore.document import Document
 from sentence_transformers import SentenceTransformer, util
 from langchain_openai import ChatOpenAI
 import os
 from dotenv import load_dotenv
-from langgraph.graph import StateGraph
 import logging
-import time
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lex_rank import LexRankSummarizer
+from langgraph.graph import StateGraph
 
-
+# Load environment variables
 load_dotenv()
 
-current_question_index = 0
-temp_interview_questions:[]
-# output_parser = StrOutputParser()
-
-
+# Initialize models
 openai_api_key = os.getenv("OPENAI_API_KEY")
 llm = ChatOpenAI(openai_api_key=openai_api_key, model="gpt-4", temperature=0.7)
 model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
 
-classifier = pipeline("zero-shot-classification", model="facebook/bart-base")
-wav2vec2_model = Wav2Vec2ForCTC.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-english")
-tokenizer = Wav2Vec2Tokenizer.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-english")
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Precompute embeddings for "move on" intent responses
-move_on_responses = [
-    "next question please", "I don’t know", "pass", "skip", "move on", 
-    "end the interview", "let's stop here", "no more questions", "I’m done", 
-    "that’s all", "let's wrap up", "I’m finished"
-]
-move_on_embeddings = model.encode(move_on_responses, convert_to_tensor=True)
-summarization_pipeline = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+# Define response categories and combine all responses into a master list
+response_categories = {
+    "Move On": ["next question please", "pass", "skip", "move on", "let's move ahead", "can we proceed?"],
+    "Clarify": ["can you repeat that?", "could you clarify the question?", "what do you mean by that?", "please explain"],
+    "Unsure": ["I'm not sure", "I don’t know", "I'm uncertain about this", "I can't give a definite answer"],
+    "Finished": ["that's all I can say", "I think I’ve covered it", "I believe I've answered the question"],
+    "End Interview": ["end the interview", "I’m done with the session", "no more questions", "let's wrap up"],
+    "General": ["I see", "interesting", "okay", "got it", "sounds good"],
+    "Positive": ["I'm excited about this", "this sounds interesting", "I would love to discuss this more"],
+    "Negative": ["this doesn't interest me", "I find this irrelevant", "I'm not interested in this topic"],
+    "Question": ["can I ask a question?", "what about this aspect?", "how does this work?", "what do you think?"],
+}
 
+all_responses = [(response, label) for label, responses in response_categories.items() for response in responses]
+
+class AgentState:
+    def __init__(self, summary=None, max_questions=8):
+        self.summary = summary
+        self.last_answer = None
+        self.asked_questions = []
+        self.last_question = None
+        self.question_count = 0
+        self.max_questions = 4  # Dynamic max questions
+
+# Utility Functions
 
 def process_audio_blob(audio_blob, chunk_size=1024):
     """
     Process large audio blobs in chunks to avoid memory overload.
-    
-    Args:
-    - audio_blob (bytes): Raw audio data (assumed to be PCM 16-bit mono).
-    - chunk_size (int): Size of each chunk in bytes for processing.
-
-    Returns:
-    - AudioSegment: Combined AudioSegment of all processed chunks, or None if an error occurs.
     """
     try:
-        # Initialize an empty AudioSegment to hold the processed chunks
-        # full_audio_segment = AudioSegment.silent(duration=0, frame_rate=16000)
         full_audio_segment = AudioSegment.empty()
-
-        # Calculate the total number of chunks
         total_chunks = len(audio_blob) // chunk_size
 
-        # Process each chunk
         for i in range(total_chunks + 1):
-            # Extract the current chunk from the audio blob
             start = i * chunk_size
             end = min(start + chunk_size, len(audio_blob))
             chunk = audio_blob[start:end]
 
             if chunk:
-                # Convert the chunk to a numpy array (assuming 16-bit PCM)
                 audio_array = np.frombuffer(chunk, dtype=np.int16)
-
-                # Create an AudioSegment from the numpy array
                 audio_segment = AudioSegment(
                     audio_array.tobytes(),
-                    frame_rate=16000,  # Assuming 16kHz frame rate for the audio
-                    sample_width=2,    # 2 bytes (16-bit) per sample
-                    channels=1         # Mono audio
+                    frame_rate=16000,
+                    sample_width=2,
+                    channels=1
                 )
-
-                # Concatenate the chunk to the full audio
                 full_audio_segment += audio_segment
 
         return full_audio_segment
 
     except Exception as e:
-        logger.error(f"Error processing audio blob in chunks: {e}")
+        logging.error(f"Error processing audio blob: {e}")
         return None
 
+def parse_resume(pdf_file_data: bytes):
+    """
+    Extract text from a PDF resume.
+    """
+    try:
+        text = ""
+        pdf_file = BytesIO(pdf_file_data)
+        with pdfplumber.open(pdf_file) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text
+
+        if not text:
+            raise ValueError("No text found in the PDF.")
+
+        logging.info(f"Parsed text length: {len(text)} characters")
+        return text
+
+    except Exception as e:
+        logging.error(f"Error parsing PDF: {str(e)}")
+        raise ValueError(f"Failed to parse PDF: {str(e)}")
+
+async def summarize_resume(text: str, min_sentences=6, max_sentences=15):
+    """
+    Summarize the resume text using LexRankSummarizer.
+    """
+    try:
+        parser = PlaintextParser.from_string(text, Tokenizer("english"))
+        summarizer = LexRankSummarizer()
+        summary_sentences = summarizer(parser.document, sentences_count=max_sentences)
+        selected_summary = summary_sentences[:max(min_sentences, len(summary_sentences))]
+        summary = " ".join(str(sentence) for sentence in selected_summary)
+        return summary
+
+    except Exception as e:
+        logging.error(f"Error summarizing resume: {e}")
+        return "Error in summarizing the resume."
+
+def dynamic_rate_sentence(sentence):
+    """
+    Dynamically rate user input and detect intent using cosine similarity.
+    """
+    sentence_embedding = model.encode(sentence, convert_to_tensor=True)
+    response_embeddings = model.encode([resp[0] for resp in all_responses], convert_to_tensor=True)
+
+    similarities = util.pytorch_cos_sim(sentence_embedding, response_embeddings).squeeze(0)
+
+    max_similarity, best_match_index = similarities.max().item(), similarities.argmax().item()
+    best_match, detected_intent = all_responses[best_match_index]
+
+    normalized_score = (max_similarity + 1) / 2
+
+    return normalized_score, best_match, detected_intent
+
+def get_prompt_for_intent(intent, answer, summary, question):
+    """
+    Returns the appropriate prompt based on the detected intent.
+    """
+    prompts = {
+        "Move On": (
+            f"The candidate wants to move forward, responding with: '{answer}'. "
+            f"Ask a new question related to their skills or experience, avoiding the topic from: '{question}'."
+        ),
+        "Clarify": (
+            f"The candidate asked for clarification: '{answer}'. Rephrase the question: '{question}', "
+            f"keeping it related to '{summary}'."
+        ),
+        "Unsure": (
+            f"The candidate was unsure: '{answer}'. Ask a simpler question exploring another aspect of '{summary}'."
+        ),
+        "Finished": (
+            f"The candidate indicated completion: '{answer}'. Ask a follow-up question focusing on a different topic."
+        ),
+        "End Interview": (
+            f"The candidate wants to conclude: '{answer}'. Prepare a closing statement."
+        ),
+        "General": (
+            f"The candidate gave a general response: '{answer}'. Ask a more specific follow-up question."
+        ),
+        "Question": (
+            f"The candidate asked a question: '{answer}'. Respond and ask a related follow-up."
+        ),
+    }
+    return prompts.get(intent, (
+        f"Candidate's response: '{answer}'. Resume summary: '{summary}'. Previous question: '{question}'. "
+        f"Generate a detailed follow-up question focusing on technical skills or relevant experiences."
+    ))
 def clear_audio_segment(audio_segment, silent_ranges):
     """
     Removes the detected silence from the audio segment.
@@ -124,8 +198,6 @@ def clear_audio_segment(audio_segment, silent_ranges):
     cleaned_audio += audio_segment[prev_end:]
 
     return cleaned_audio
-
-
 
 
 def detect_silence(audio_segment, min_silence_len=5000):
@@ -183,157 +255,57 @@ def detect_silence(audio_segment, min_silence_len=5000):
     except Exception as e:
         print(f"Error detecting or clearing silence: {e}")
         return False, audio_segment, overall_dBFS_int
- 
 
-def is_general_question(question):
-    # candidate_labels = ['general', 'question', 'answer','no-answer','dont-know-the-answer','move-to-next-question']
-    candidate_labels = ['general', 'question', 'answer','Unanswered']
-
-    
-    result = classifier(question, candidate_labels=candidate_labels, multi_label=True,device=0)
-    print('Classifier result:', result) 
-    
-    scores = {label: score for label, score in zip(result['labels'], result['scores'])} # Get the scores for the labels
-
-    return  scores
-    
-
-
-
-
-
-
-# AgentState Class to track state information during the interview
-class AgentState:
-    def __init__(self, summary=None, last_answer=None):
-        self.summary = summary
-        self.last_answer = last_answer
-        self.asked_questions = []  # Keep a history of asked questions
-        self.last_question = None  # Track the last question asked
-        self.question_count = 0    # Track the number of questions asked
-
-# Parse the PDF resume
-def parse_resume(pdf_file_data: bytes):
-    try:
-        logging.info("Attempting to parse PDF resume")
-        text = ""
-        pdf_file = BytesIO(pdf_file_data)
-        with pdfplumber.open(pdf_file) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text
-        if not text:
-            raise ValueError("No text found in the PDF.")
-        logging.info(f"Parsed text length: {len(text)} characters")
-        return text
-    except Exception as e:
-        logging.error(f"Error parsing file: {str(e)}")
-        raise ValueError(f"Failed to parse file: {str(e)}")
-
-# Summarize the resume
-async def summarize_resume(text: str, min_sentences=6, max_sentences=15):
-    if not text:
-        raise ValueError("Empty text received for summarization.")
-
-    start_time = time.time()
-    parser = PlaintextParser.from_string(text, Tokenizer("english"))
-    summarizer = LexRankSummarizer()
-    summary_sentences = summarizer(parser.document, sentences_count=max_sentences)
-    selected_summary = summary_sentences[:max(min_sentences, len(summary_sentences))]
-    summary = " ".join(str(sentence) for sentence in selected_summary)
-    
-    end_time = time.time()
-    logging.info(f"Summarization took {end_time - start_time:.2f} seconds.")
-    
-    return summary 
-
-# Generate initial question
-def generate_initial_question(summary: str) -> str:
-    logging.info(f"Generating initial question based on summary: {summary}")
-    prompt = f"""
-    Based on the following candidate summary:
-    {summary}
-    Generate a first interview question that covers both the candidate's skills and their most recent work experience.
+def invoke_llm_with_retry(prompt, asked_questions, max_retries=2):
     """
-    response = llm.invoke(prompt)
-    return response.content.strip()
-
-# Determine if user intent indicates moving on
-# Updated `is_move_on_intent` with refined matching and more diversified phrases
-def is_move_on_intent(answer: str, threshold=0.3) -> (bool, str):
-    answer_embedding = model.encode(answer, convert_to_tensor=True)
-    
-    # Calculate cosine similarities between the answer and each move-on response
-    similarities = util.pytorch_cos_sim(answer_embedding, move_on_embeddings).squeeze(0)
-    max_similarity, best_match_index = similarities.max().item(), similarities.argmax().item()
-    
-    # Retrieve the best matching phrase
-    best_match_phrase = move_on_responses[best_match_index]
-    logging.info(f"Best match phrase: '{best_match_phrase}' with similarity score: {max_similarity}")
-
-    # Determine if this similarity exceeds the threshold
-    return max_similarity > threshold, best_match_phrase if max_similarity > threshold else None
-
-
-
-# Generate follow-up question based on intent and simulate realistic interview behavior
-def generate_follow_up_question(answer: str, summary: str, question: str, asked_questions: list) -> str:
-    # Check if the candidate's response matches a move-on intent and get the matched phrase
-    intent_score, best_match_phrase = is_move_on_intent(answer)
-    logging.info(f"Best match phrase: '{best_match_phrase}' with similarity score: {intent_score}")
-
-    # Route the prompt based on the best match phrase
-    if best_match_phrase in ["I don’t know", "pass", "skip"]:
-        # If the candidate doesn't know or wants to skip, move to a different topic
-        prompt = (
-            f"The candidate's response of '{answer}' indicates uncertainty or a desire to skip. "
-            f"As an interviewer, ask a question that explores another aspect of their role related to '{summary}', "
-            f"and avoid the previous topic '{question}'. Focus on a new area of expertise."
-        )
-    elif best_match_phrase in ["next question please", "move on"]:
-        # Candidate wants to move on, proceed to the next relevant topic
-        prompt = (
-            f"The candidate's response of '{answer}' suggests they want to proceed to another topic. "
-            f"Ask them to describe their experience with a different technology or project related to their role, "
-            f"focusing on skills listed in their resume summary: '{summary}'."
-        )
-    elif best_match_phrase in ["end the interview", "let's stop here", "no more questions", "I’m done", "that’s all", "let's wrap up", "I’m finished"]:
-        # Candidate wants to end the interview
-        logging.info("Ending interview based on candidate's response.")
-        return "Thank you for your time. We’ll conclude the interview here. Best of luck with your next steps!"
-    else:
-        # Standard case for follow-up if no specific move-on intent is detected
-        prompt = (
-            f"Candidate's answer: '{answer}'. Resume summary: '{summary}'. Previous question: '{question}'. "
-            f"Generate a follow-up question that dives into technical specifics, focusing on their usage of "
-            f"relevant tools, techniques, or technologies, and ask them to elaborate on the process."
-        )
-
-    try:
-        response = llm.invoke(prompt)
-        next_question = response.content.strip()
-        
-        # Log the generated follow-up question
-        logging.info(f"Generated follow-up question: {next_question}")
-
-        # Check for previously asked questions to avoid repetition
-        if next_question in asked_questions:
-            prompt += " Ensure this follow-up question is unique and hasn't been covered already."
+    Invokes the language model to generate a follow-up question and ensures it's unique.
+    """
+    for _ in range(max_retries):
+        try:
             response = llm.invoke(prompt)
             next_question = response.content.strip()
-            logging.info(f"Modified follow-up question to avoid repetition: {next_question}")
 
-        return next_question
+            if next_question not in asked_questions:
+                asked_questions.append(next_question)
+                logging.info(f"Generated follow-up question: {next_question}")
+                return next_question
+
+            logging.info(f"Duplicate question detected. Retrying...")
+            prompt += " Ensure this question is unique."
+
+        except Exception as e:
+            logging.error(f"Error generating follow-up question: {e}")
+
+    return "Could you clarify your answer or provide more details?"
+
+def generate_initial_question(summary: str) -> str:
+    """
+    Generate the first interview question based on the summarized resume.
+    """
+    prompt = f"Based on the candidate's resume summary: '{summary}', generate an initial interview question."
+    try:
+        response = llm.invoke(prompt)
+        initial_question = response.content.strip()
+        return initial_question
 
     except Exception as e:
-        logging.error(f"Error in generate_follow_up_question: {e}")
-        return "Could you clarify your answer or provide more details about your interest?"
+        logging.error(f"Error generating initial question: {e}")
+        return "Could you describe your recent experience?"
 
+def generate_follow_up_question(answer: str, summary: str, question: str, asked_questions: list) -> str:
+    """
+    Generate follow-up questions based on detected intent and previous responses.
+    """
+    rating, best_match_phrase, detected_intent = dynamic_rate_sentence(answer)
+    logging.info(f"User's response: {answer}, Detected intent: {detected_intent}")
 
+    prompt = get_prompt_for_intent(detected_intent, answer, summary, question)
+    logging.info(f"Generated prompt: {prompt}")
 
+    next_question = invoke_llm_with_retry(prompt, asked_questions)
+    return next_question
 
-# StateGraph for managing interview process
+# InterviewGraph for managing interview flow
 class InterviewGraph(StateGraph):
     def __init__(self, state: AgentState):
         super().__init__(state)
@@ -355,8 +327,9 @@ class InterviewGraph(StateGraph):
         return "Let's start the interview!"
 
     def ask_question(self):
-        if self.state.question_count >= 4:  # Limit questions to a maximum of 8
+        if self.state.question_count >= self.state.max_questions:
             return self.end_interview()
+
         first_question = generate_initial_question(self.state.summary)
         self.state.asked_questions.append(first_question)
         self.state.last_question = first_question
@@ -368,7 +341,7 @@ class InterviewGraph(StateGraph):
         summary = self.state.summary
         question = self.state.last_question
 
-        if self.state.question_count >= 4:  # Limit to a maximum of 8 questions
+        if self.state.question_count >= self.state.max_questions:
             return self.end_interview()
 
         next_question = generate_follow_up_question(answer, summary, question, self.state.asked_questions)

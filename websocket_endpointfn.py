@@ -10,7 +10,7 @@ import logging
 logger = logging.getLogger(__name__)
 executor = ThreadPoolExecutor(max_workers=10)
 from utils import (
-    parse_resume, summarize_resume, generate_initial_question, generate_follow_up_question, AgentState, InterviewGraph,process_audio_blob,detect_silence
+    parse_resume, summarize_resume, generate_initial_question, AgentState, InterviewGraph,process_audio_blob,detect_silence
 )
 class InterviewBot:
     def __init__(self):
